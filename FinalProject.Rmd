@@ -1,0 +1,447 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+#Dataset Selection
+
+```{r}
+library(stringr)
+library(tidyr)
+library(dplyr)
+library(glmnet)
+
+whitelist <- read.delim("data/whitelist.txt",sep="\n",header=FALSE)
+y_data <- read.csv("data/processed_data.csv")
+
+# 2. Filter to your whitelist
+filtered  <- y_data %>% 
+  filter(LUI %in% whitelist$V1)
+
+temps <- filtered %>% select(LUI, q50)
+
+hist(temps$q50)
+
+genomic_data <- read.csv("data/ChloroplastProteinsPCAEncoded.csv")
+filtered_genomic_data  <- genomic_data %>% 
+  filter(X %in% whitelist$V1)
+
+filtered_genomic_data$LUI <- filtered_genomic_data$X
+filtered_genomic_data <- filtered_genomic_data[,-1]
+
+data <- merge(filtered_genomic_data, temps)
+
+data <- Filter(function(x) length(unique(x[!is.na(x)])) > 1,
+                     data)
+
+#keep only rows with unique LUIs
+data <- data[!duplicated(data$LUI), ]
+
+#use these to save and return to the work :)
+write_rds(data, "data/data.Rds")
+data <- readRDS("data/data.Rds")
+```
+
+### Introduction
+
+1. Choose a dataset from Kaggle; I choose a dataset of my own production and uploading, which contains chloroplast protein sequence information and growth temperature for the plants containing those chloroplasts.  https://www.kaggle.com/datasets/henrydebaundawson/cornell6020statsfinal
+
+2. Your dataset must have a continuous target variable suitable for linear regression. Here, the variable 'q50' is the target variable, and is continous and suitable for linear regression. The variable represents the optimal growth temperature of a plant. I get it by searching occurence databases for plant occurences - this produces, for each species, a set of a few to tens of thousand coordinate pairs, each describing where that plant has been observed in the world. I take these coordinate pairs and access the WorldClim bio8 model (https://www.worldclim.org/data/bioclim.html) which contains the mean temperature of the wettest quarter. Water limits plant growth; should there be a temperature for which the plant is optimized, it would likely be the one in which they are growing the most. For each species, I measure the mean temperature of the wettest quarter for all occurences; q50 is the median temperature (50th quantile) of those measurements.
+
+3. The dataset should contain multiple potential predictor variables: the predictor variables represent protein residues, with a little twist. In a traditional genomic analysis, these would represent the specific alleles: for a nucleotide (DNA) analysis, that would be A, C, T, G, and for an amino acid (protein) analysis there are 20 alleles, for twenty amino acids. So each row in this dataset represents all the amino acids in all chloroplast proteins in one species , and each predictor column is a specific residue in a specific protein, which may vary across species but in general has the same meaning (e.g. column 100 could correspond to the amino acid residue in the active site of Rubisco).
+
+However, each amino acid has distinct biochemical properties, and analysis of them as arbitrary categorical variables does not include such information. I hypothesize that general biochemical properties - hydrophobicity, size, flexibility - are modified in the chloroplast to adapt to temperature conditions. Otherwise, we would have a scenario where the same enzymes are functioning in different temperature conditions. Since such reactions are very sensitive to temperature, this would mean the most vital and common reactions in all plants outside the temperature optimum for the first photosynthetic ancestor are horribly inefficient and maladapted. But since plants grow well in different temperatures, we can assume that adaptation has occurred. 
+
+The way I will test this hypothesis by transforming the amino acid residues according to their biochemical properties. I've downloaded a large dataset of biochemical descriptors of amino acids, and performed a principal component analysis on it. I projected each residue onto that space, and replaced the categorical values for each residue with continuous variables representing the value of that residue along each principal component. I expanded the dataset to the first three principal components, so each residue has 3 columns, one for each of the first three principal coordinates.
+
+4. The chloroplast is what makes plants green; it is a small organelle containing photosynthetic machinery and a small genome. What's remarkable is that every plant has more or less the same chloroplast genome, containing around 80 protein-coding genes. It is the subject of my research, and an interesting topic! If there is temperature adaptation in the chloroplast, that has certainly not been a subject of experimentation for plant breeding, and could be beneficial in helping crop plants adapt to a warming and changing world.  
+
+But why is it useful to produce a regression model that takes chloroplast proteins and outputs a temperature? This value would allow us to 1. predict optimal growth temperatures for crop species and 2. perform genetic analyses of nuclear genes against this predicted optimal temperature - what nuclear genes (a more immediate target for engineering) seem responsible for co-adaptation or compensating for temperature? 
+
+
+#### Exploratory Data Analysis
+
+* Summary statistics of variables
+* Visualization of distributions and relationships
+
+```{r}
+summary(data$q50)
+par(mfrow=c(1,1))
+hist(data$q50, main="Distribution of Response Variable - Plant Growth Temperature")
+```
+
+The minimum temp is -6C, while the median is 21C, and the max is 32C. These constitute quite an impressive range; -6C is obviously freezing, while 32C is generally hot - bear in mind the hottest environments, like the desert, have a severe temp oscillation from day to night which will drive the mean temp measurement downward. 
+
+The temp data appear generally unimodal but with a left skew; more of the plants are colder relative to the peak than are hot. 
+```{r}
+#cor(data[,2:11])
+#heatmap(cor(data[,2:201]),Rowv = NA, Colv = NA)
+
+par(mfrow=c(3,3))
+for (i in 2:10) {
+  hist(data[,i],main=substr(colnames(data)[i],48,nchar(colnames(data)[i])))
+}
+```
+Let's analyze a snippet of the predictor variables. The chloroplast is highly conserved, so we expect a given variable to have a very high percentage of values being the same. Even though we've done the PCA projection, that just places all amino acids at a site onto the same axes, and doesn't alter the underlying distribution. 
+
+The heatmap shows that there are high regions of collinearity. This is a classical feature of genomic data. As these species evolved and diverged from their common ancestor, they would carry mutations with them. So for a plant in lineage A with mutation X, all descendant plants would likely also carry that mutation X, and also probably mutations Y and Z, which will then correlate. This is the biological basis for the high collinearity in predictor values, and 
+
+We can get a sense of clustering of our data by performing a principal component analysis:
+
+```{r}
+#pca <- prcomp(data[,-1],center=TRUE,scale.=TRUE,rank.=5)
+#summary(pca)
+#plot(pca)
+#plot(pca$x[,1],pca$x[,2])
+```
+
+
+* Identification of missing values and outliers
+* Data cleaning and preprocessing steps
+
+There are no missing data, but the pca above suggests some outliers. These may have been mis-annotated by genome annotation software, resulting in incorrect protein sequences. Or they could be very diverged chloroplast sequences, which would be a biological outlier but not necesarily inappropriate for the analysis. Since I have done a number of upstream quality control steps:
+
+1. removing species that are not plants by accessing taxonomic data
+2. removing species based on number of genes annotated
+3. removing species based on number of amino acids found
+4. keeping only species that have annotations for the 16 most conserved genes
+
+I will keep my data as is.
+
+#### Variable Selection & Hypothesis Testing
+
+* Implement at least two different variable selection techniques
+
+First, I will rest Ridge regression on my dataset. 
+Cross-validation in genomic contexts needs to be evolutionarily guided to avoid overfitting to the covariance structure present in the data due to evolution, not adaption. This will be done by using the grouping of the data into Orders, a broad taxonomic classification, of which there are around 60 represented in this dataset.  Some are major and worth segmenting off, and some only have a few included
+```{r}
+order_data <- read.csv("data/sample_classification.csv")
+order_data$LUI <- order_data$Line
+order_counts <- as.data.frame(table(order_data$File.Name))
+order_counts$Major <- order_counts$Freq > 20
+order_counts$foldid <- 1
+foldid <- 2
+for (i in 1:nrow(order_counts)) {
+  if (order_counts$Major[i]) {
+    order_counts$foldid[i] <- foldid
+    foldid <- foldid + 1
+  }
+}
+
+fold_data <- merge(order_data,order_counts,by.x="File.Name",by.y="Var1") %>%
+  select(LUI, foldid) 
+
+fold_data <- fold_data[!duplicated(fold_data$LUI),]
+
+fold.ids <- data %>%
+  left_join(fold_data, by = "LUI") %>%  
+  pull(foldid)   
+```
+
+Great, now I have the fold ids I need for evolutionarily aware cross validation, I can use glmnet to fit the cv model.
+
+Noting that the Order Poales, which contains the grasses and the crop corn, has foldid 29! so I might want to withold that later for testing.
+
+let's fit the model without a custom cross validation scheme to observe initial behavior:
+
+```{r}
+x_var <- data.matrix(select(data, !c(LUI,q50)))
+y_var <- data[, "q50"]
+lambda_seq <- 10^seq(2, -2, by = -.1)
+fit <- glmnet(x_var, y_var, alpha = 1, lambda  = lambda_seq)
+plot(fit)
+```
+
+```{r}
+cv.fit <- cv.glmnet(x_var, y_var, alpha = 1, lambda  = lambda_seq)
+plot(cv.fit,label=TRUE)
+```
+Here, we see a minimum random cross-validation MSE around 20 C^2. This is 75% of one standard deviation of the response variable. 
+
+
+Now, let's fit the custom cross-validated model. But first, I will explain why it is necessary to do this. 
+
+Cross-validation in genomic contexts needs to be evolutionarily guided to avoid overfitting to the covariance structure present in the data due to evolution, not adaption. This will be done by using the grouping of the data into Orders, a broad taxonomic classification, of which there are around 60 represented in this dataset.  
+
+Think of it this way; there are cactuses and pine trees present in the data. The variables within cactus and a pine tree are highly correlated, so a model could easily distinguish the two. And, since these groups have a general pattern of temperature, by virtue of recognizing the similarity to a previously seen species, the model could learn the temperature without getting at the principles we assume underlie temperature adaptation - that there are general mechanisms a protein can change to adapt to a temperature. There is necessarily a bit of crossover here, but this illustrates the problem we want to avoid.
+
+* Assess model performance with metrics (R², adjusted R², RMSE, etc.)
+
+```{r}
+small_x <- x_var[1:100,]
+small_y <- y_var[1:100]
+small_fid <- fold.ids[1:100]
+
+stopifnot(is.matrix(small_x),
+          length(small_y) == nrow(small_x),
+          length(small_fid) == nrow(small_x))
+
+cv.fit <- cv.glmnet(x=small_x, y=small_y, foldid = small_fid)
+plot(cv.fit)
+```
+
+```{r}
+dim(x_var)
+length(y_var)
+length(fold.ids)
+table(fold.ids)
+```
+
+Let's search across a range of alpha values to investigate the balance between LASSO, RIDGE, and Elastic net. 
+```{r}
+cv_results <- vector("list", length = 10)
+require(doMC)
+registerDoMC(cores = 40)
+for (i in 1:10) {
+  alph <- i/10
+  cv_results[[i]] <- cv.glmnet(x_var, y_var, 
+                             alpha=alph,foldid = fold.ids,
+                             parallel=TRUE)
+}
+```
+Now that we have fitted the model, we can plot the mean squared error over lambda to observe performance. 
+
+```{r}
+par(mfrow=c(3,3))
+for (i in 1:10) {
+  plot(cv_results[[i]], main=paste("alpha=",i/10,"\n"), col="red")
+}
+```
+It looks like they are all comparable - maybe one of the Elastic net's, 6, is best. I wonder if the coefficients are stable across these models?
+
+```{r}
+coef_df <- coef(cv_results[[6]], s = "lambda.min")
+```
+Previous results have shown a decrease in model performance when we include all species. For instance, a MLR fit to temp ~ amino acid proportion (20 variables, each representing the fraction each amino acid is in the proteome) fit the poales with an R^2 of ~0.5 and the whole dataset with an R^2 of ~0. 
+
+I benchmark mentally the relative performance of the model by assessing the performance on this smaller subset. 
+```{r}
+poales_cv <- cv.glmnet(x=x_var[which(fold.ids==29),], y=y_var[which(fold.ids==29)], 
+                             alpha=1,
+                             parallel=TRUE)
+par(mfrow=c(1,1))
+plot(poales_cv)
+```
+The MSE here is comparable to that of the random validation - which is quite good.
+
+
+Now, I will use the second variable selection method, ridge regression, which unlike the elastic or lasso net will not drive any variables to 0, but will instead severely penalize their coefficients. This means it is not a true variable selection method per se, but will suffice
+```{r}
+cv_ridge <- cv.glmnet(x_var, y_var, 
+                             alpha=0,foldid = fold.ids,
+                             parallel=TRUE)
+plot(cv_ridge)
+```
+This performs much more poorly - the CV MSE is much higher, and the spread on it is greatrer as well. 
+
+Specifically, even searching over a number of alpha parameters, which vary the penalty between LASSO and RIDGE, it does not seem that any model has great predictive accuracy - the spread of our data is about 35C, and low MSE is 25C^2. So, while it's not bad, neither would I say it is great. The RIDGE model, which only minimizes variables, performed worse than the elastic or lasso models across the board.
+
+I would probably not be able to use it to predict the absolute temperature - which, given how it was measured, would be noisy regardless. But! Part of what I am curious about here is adaptation - in other words, do any sites appear to have a significant relationship with temperature? 
+
+In other words, after going through this process to select the best variables, do any have a significant relationship with the response variable?
+
+
+#### Regression Assumptions Verification
+
+As my initial dataset has many more predictors than samples (n << p), I cannot perform a standard MLR and will need to use initially the variable selection methods, and then test the signficance of the coefficients when I use them as predictors in a standard MLR. This is not sound inference but follows the intended exercise, I believe. Significance for Lasso model coefficients is an active area of research (https://arxiv.org/pdf/1301.7161), so this will have to do. The collinearity in my model violates the an assumption of the test in that paper, so I will not use it. 
+
+* Linearity assessment
+
+```{r}
+mod <- cv_results[[6]]
+coeffs <- coef(mod, s = "lambda.min")
+hist(coeffs[which(coeffs!=0)][-1],main="Histogram of estimated coefficients") #remove the intercept
+
+varnames <- names(data[,-1])[which(coeffs!=0)]
+```
+Here are the coefficients selected by the model; do they have a linear relationship with the response variable?
+
+```{r}
+par(mfrow=c(3,3))
+sumry <- summary(coeffs)
+for (i in 2:nrow(sumry)) {
+  varname <- (names(data[,-1])[sum$i[i]])
+  plot(data[,varname],data$q50,
+       main=paste(substr(varname,48,nchar(varname)), "estimate:",round(sumry$x[i],3)),xlab="")
+  abline(a=sumry$x[1],b=sumry$x[i],col="red")
+}
+```
+
+Examining these results, the linear model seems a tenous fit. The intense grouping of the data (no normal distributions, everything is clustered in specific values) makes a traditional linear relationship unclear from singular relationships. While this may not hold in aggregate, this test shows a violation of the assumption of the linear model. In some of the best cases, like s_22278_pc3, there does appear to be a grouping of the data into hotter and colder by this site, but it is prevented from being linear by the spread of the site. 
+
+This strategy does do a good job handling multiallelism because it is able to extrapolate one relationship across multiple alleles at one loci, which is shown in s_22149_pc1. It is quite sensitive to outliers - the site s_17274_pc1 has 4 datapoints outside the main group. Perhaps excluding not only invariant sites, but sites with an exceedingly rare minor allele might be useful. But these are often the very mutations we are looking for! 
+
+In a sense, this is what I hope to test by fitting the models to follow and observing the results. 
+
+Previous research has suggested a linear relationship of causal variants on traits, which provides evidence for the assumption of a linear interaction. (https://www.biorxiv.org/content/10.1101/2022.10.04.509926v1). Though this is in humans, it is a nice bit of theoretical evidence. 
+
+There is also evidence that small effect loci have an additive effect on outcome traits in plant breeding (https://www.nature.com/articles/hdy201578), and there are numerous studies using models based on this concept. 
+
+* Normality of residuals & * Homoscedasticity (constant variance of residuals)
+
+```{r}
+par(mfrow=c(1,2))
+fitted_values <- predict(mod, x_var, s = 'lambda.1se')
+residuals <- y_var - fitted_values
+plot(scale(fitted_values), scale(residuals))
+hist(residuals)
+```
+The residuals look normal with a strong left skew. The plot of standardized residuals against fitted values does not show a fan or grouping pattern - but there are bands with significant conspicuousness. But, in general, model error does not seem to depend on X overall, since the pattern looks generally homoskedastic.  
+
+* Independence of observations
+This is a tough one! As above, there is an inherent structure to the data, but the measurement of temperature is independent as a result of the experimental design. Though there is population structure between these samples, this should affect only the independence of the predictor variables, not the outcomes. 
+
+* Multicollinearity assessment
+The data are highly multicollinear, which can be seen in the heatmap above. The data cluster in some groups when a PCA is performed (this was on related data with the same covariance structure but of a different format. I used the DNA sequence of the 16 most conserved genes for the PCA, not the protein sequence of all genes - the computation is too lengthy to reproduce here.)
+![PCA plot](/workdir/hdd29/statsfinal/proteinPCA.png)
+
+
+#### Assumption Violation Handling
+
+* Apply appropriate transformations when assumptions are violated
+* Document your approach to each violation
+
+I do this above with the way I handle folding in the crossvalidation. Another method I could take to reduce colinnearity would be to use PC projections of the genotype data; these would be orthogonal and minimize collinearity, but don't allow me the interpretations I am curious about so I will not do it. 
+
+* Compare models before and after corrections
+
+The model increased MSE when I accounted for the population structure underlying the data. I do not believe I have learned a transformation which could handle the distributions of genomic data to produce a linear model. 
+
+
+
+#### Feature Impact Analysis
+
+* Perform hypothesis tests on coefficients
+Since the data informed model selection process violates assumptions of inference, I will instead use the variables found by the elastic net regression on the training set to fit a MLR on the testing set, and test the signficiance of these coefficients. 
+
+```{r}
+mlr <- lm(as.formula(paste("q50 ~ ", paste(names(data[,-1])[sumry$i], collapse = "+"))),data=data)
+summary(mlr)
+```
+The test of seeing the observed association between each site and the outcome variable was tested by the lm() function, but I will replicate it here based off coefficients. 
+
+```{r}
+est <- 1.752e-01
+stde <-  3.000e-02 
+t <- est/stde
+
+pt(t, df=nrow(data),lower.tail = FALSE)
+```
+This is the probability of seeing the observed association under the null hypothesis of no association (bx = 0), and since it is under our decision threshold (0.05>\*...0.001>***) we decide to reject the null hypothesis of no association. 
+
+* Quantify and interpret the impact of each feature on the target
+```{r}
+mod_sum <- summary(mlr)
+mlr_coeffs <- as.data.frame(mod_sum$coefficients)
+hist(mlr_coeffs$Estimate)
+par(mfrow=c(1,1))
+plot(mlr_coeffs[which(mlr_coeffs$`Pr(>|t|)` < 0.001),'Estimate'],main="Estimates of significant coefficients")
+abline(h=0,lty=2)
+```
+There are a number of significant variables in this model. Of those with a significant association, the most significant are sites 20973_pc1 which has a massive increase; 21C increase in temperature for 1 unit increase in that variable. This is because there is a small range for this value, 0.3, and most elements in the dataset have a negative value, so this may be functioning as a rough intercept for the temperature of the model. 
+
+```{r}
+plot(data[,'supermatrix_excl_under50genes_under10kAminoAcids_20973_pc1'],data[,"q50"])
+```
+
+* Provide confidence intervals for significant coefficients
+
+```{r}
+par(mfrow=c(1,1))
+plot(confint(mlr), main="Confidence intervals of coefficients")
+points(0,0,pch=3,col="red")
+```
+The plot above shows the confidence intervals for the MLR coefficients. The range for confidence intervals for most coefficients show clustering around 0,0, indicating small effects. Some points are outliers, with a massive range from for example -100C to 10C, and are not significant. How many confidence intervals include 0?
+
+```{r}
+conf_df <- na.omit(as.data.frame(confint(mlr)))
+sum((conf_df[,1] < 0) & (conf_df[,2] > 0))
+```
+There are 46 coefficients with a confidence interval that includes 0, which means they cannot be said to have a significant directional association with temperature. For these points we fail to reject the null. 
+
+* Explain the practical significance of your findings in the context of the dataset
+
+The most significant site in the LASSO regression is 1085. Looking at my data, I can see that this is a T-A substitution in atpB, a key energy production enzyme. The MLR also assigned significance to this site. 
+
+Make test/train data, witholding 1. poaceae and 2. an arbitrary subset
+```{r}
+x_var_train <- x_var[which(fold.ids!=29),]
+x_var_test <- x_var[which(fold.ids==29),]
+
+y_var_train <- y_var[which(fold.ids!=29)]
+y_var_test <- y_var[which(fold.ids==29)]
+
+train_foldids <- fold.ids[which(fold.ids!=29)]
+train_foldids[which(train_foldids > 29)] <- train_foldids[which(train_foldids > 29)] -1
+
+dim(x_var_train)
+length(y_var_train)
+
+dim(x_var_test)
+length(y_var_test)
+
+require(doMC)
+registerDoMC(cores = 40)
+
+cv_ridge_anyfolds <- cv.glmnet(x_var_train, y_var_train, 
+                             alpha=0,
+                             parallel=TRUE)
+cv_elastic_anyfolds <- cv.glmnet(x_var_train, y_var_train, 
+                             alpha=0.6,
+                             parallel=TRUE)
+cv_lasso_anyfolds <- cv.glmnet(x_var_train, y_var_train, 
+                             alpha=1,
+                             parallel=TRUE)
+
+cv_ridge_myfolds <- cv.glmnet(x_var_train, y_var_train, 
+                             alpha=0,foldid = train_foldids,
+                             parallel=TRUE)
+cv_elastic_myfolds <- cv.glmnet(x_var_train, y_var_train, 
+                             alpha=0.6,foldid = train_foldids,
+                             parallel=TRUE)
+cv_lasso_myfolds <- cv.glmnet(x_var_train, y_var_train, 
+                             alpha=1,foldid = train_foldids,
+                             parallel=TRUE)
+```
+
+```{r}
+par(mfrow=c(3,2))
+plot(cv_ridge_anyfolds,main="Ridge, any cv \n",ylim=c(30,300))
+plot(cv_ridge_myfolds,main="Ridge, custom cv \n",ylim=c(30,300))
+plot(cv_elastic_anyfolds,main="Elastic, any cv \n",ylim=c(15,50))
+plot(cv_elastic_myfolds,main="Elastic, custom cv \n",ylim=c(15,50))
+plot(cv_lasso_anyfolds,main="Lasso, any cv \n",ylim=c(15,50))
+plot(cv_lasso_myfolds,main="Lasso, custom cv \n",ylim=c(15,50))
+```
+
+```{r}
+assess.glmnet(cv_ridge_anyfolds, newx = x_var_test, newy = y_var_test)
+assess.glmnet(cv_elastic_anyfolds, newx = x_var_test, newy = y_var_test)
+assess.glmnet(cv_lasso_anyfolds, newx = x_var_test, newy = y_var_test)
+
+assess.glmnet(cv_ridge_myfolds, newx = x_var_test, newy = y_var_test)
+assess.glmnet(cv_elastic_myfolds, newx = x_var_test, newy = y_var_test)
+assess.glmnet(cv_lasso_myfolds, newx = x_var_test, newy = y_var_test)
+```
+
+
+
+#### Deliverables
+
+GitHub Repository containing:
+
+* All code (well-documented Rmd files)
+* README.md with clear instructions on how to run your analysis
+* Data folder (or instructions for accessing the data)
+* Requirements.txt or environment.yml file
+
+
+#### Final Report (PDF) containing:
+
+* Introduction: dataset description and problem statement
+* Methodology: techniques used and justification
+* Results: findings from your analysis
+* Discussion: interpretation of results and limitations
+* Conclusion: summary and potential future work
+* References: cite all sources used
+
