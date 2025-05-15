@@ -363,6 +363,12 @@ There are 46 coefficients with a confidence interval that includes 0, which mean
 
 The most significant site in the LASSO regression is 1085. Looking at my data, I can see that this is a T-A substitution in atpB, a key energy production enzyme. The MLR also assigned significance to this site. 
 
+Are the significant sites enriched for any PC out of 1, 2, or 3?
+```{r}
+table(substr(names(data)[-1][summary(coeffs)$i], nchar(names(data)[-1][summary(coeffs)$i]) - 2 + 1, nchar(names(data)[-1][summary(coeffs)$i])))
+```
+No - probably because each of three is highly collinear, so the model will randomly pick one of three PCs for each variable it includes.
+
 Make test/train data, witholding 1. poaceae and 2. an arbitrary subset
 ```{r}
 x_var_train <- x_var[which(fold.ids!=29),]
